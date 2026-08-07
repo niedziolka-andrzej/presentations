@@ -32,7 +32,11 @@
 
 *Further reading: [What is the GIL in Python and why should you care?](https://dev.to/imsushant12/what-is-the-gil-in-python-and-why-should-you-care-1cai)*
 
-![Global Interpreter Lock sequence diagram](gil.webp)
+![Global Interpreter Lock sequence diagram](gil.svg)
+
+**However, multiprocessing sidesteps the GIL entirely:** each process is a separate Python interpreter with its own GIL, so CPU-bound tasks can run in true parallel across multiple cores:
+
+![Each process has its own GIL, enabling true parallelism](processes-gil.svg)
 
 ---
 
