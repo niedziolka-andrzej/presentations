@@ -316,6 +316,8 @@ env:
 | Communication | Direct memory access (easier) | Pipes/queues (more complex) |
 | Robustness | Lower (crash affects whole process) | Higher (isolation prevents cascade failure) |
 
+![threads-vs-processes](threads-visualized.png)
+
 --- 
 
 # asyncio
