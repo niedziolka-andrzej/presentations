@@ -487,9 +487,3 @@ So the real gains depend entirely on whether your stack — NumPy, Pandas, FastA
 
 - **Also worth knowing:** the free-threaded build gives up some single-threaded speed (specialising adaptive interpreter optimisations are harder without a GIL), so a single-threaded script can run measurably slower — the gap narrowed a lot in 3.14 but hasn't closed. It's a trade, not a free upgrade.
 - **Practical read for now:** treat it as the direction of travel rather than the default. Processes remain the boring, portable answer for CPU-bound work today; free-threading is what eventually makes `ThreadPoolExecutor` the right answer for *both* kinds of workload.
-
----
-
-### Notes to self
-- [x] free-threaded Python
-- [x] asyncio as dedicated section
