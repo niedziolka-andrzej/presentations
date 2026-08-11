@@ -1,11 +1,32 @@
 # A Practical Guide to Fast, Concurrent Python
 
+### Agenda:
+- GIL (Global interpreter lock) - what is it and how it came to life
+- CPU vs I/O bound problems
+- Threads vs Processes
+- Locks, Semaphores
+- asyncio
+- No-GIL Python 3.14
+
 ---
 
 ## 1. Performance Problems: CPU-bound vs I/O-bound
 
 - CPU-bound: image resizing, number crunching, parsing/serialization
 - I/O-bound: API calls, DB queries, file/network reads
+
+### Strategies
+
+**I/O bound**
+
+- [Parallelize using threads](#6-threads-vs-processes) - cheaper and faster than processes
+- Cache heavily
+
+**CPU bound**
+
+- Because of GIL, spawning multiple threads won't help
+- 1st strategy: [**optimize** the code itself](#5-optimizing-cpu-bound-work-without-parallelization)
+- 2nd strategy: [parallelize using **processes**](#6-threads-vs-processes)
 
 ---
 
@@ -151,6 +172,8 @@ with ProcessPoolExecutor(max_workers=4) as executor:
 | Communication | Direct memory access (easier) | Pipes/queues (more complex) |
 | Robustness | Lower (crash affects whole process) | Higher (isolation prevents cascade failure) |
 
+![threads-vs-processes](threads-visualized.png)
+
 ### Sizing the Pool: How Many Threads / Processes?
 
 **Threads** — since threads are cheap and I/O-bound work spends most of its time *waiting*, not computing, the pool size doesn't need to be fixed in advance. A common pattern is dynamic sizing: compute how much work there is (e.g. the number of API calls or URLs to fetch) and size the pool to match, up to a sane ceiling so you don't overwhelm the remote service, exhaust file descriptors, or flood a rate limit:
@@ -188,8 +211,21 @@ with ProcessPoolExecutor(max_workers=worker_count) as executor:
 ```
 
 - **Core count is a ceiling, not a target** — going past `available_cores` just adds scheduling overhead (context switches between more processes than there are cores to run them on) with no extra throughput.
+- **Both calls count *logical* cores**, so hyperthreaded siblings are included — for CPU-bound work they're worth well under a full core each, so the real ceiling is lower than the number suggests.
 - **Leave headroom** — `available_cores - 1` keeps a core free for the main/parent process, the OS scheduler, and any other work on the machine, so the pool doesn't starve everything else.
 - **On Kubernetes, both of those calls can lie** — a pod's `resources.limits.cpu` is enforced via a cgroup CFS quota, not by restricting which cores the process can see, so `os.process_cpu_count()` still reports the *node's* cores unless the cluster also pins CPUs (Guaranteed QoS + static CPU Manager policy). Read the cgroup quota directly (`cpu.max` on cgroup v2, `cpu.cfs_quota_us` / `cpu.cfs_period_us` on v1) to get the pod's real limit.
+
+**Kubernetes example** — or skip the introspection entirely and pass the CPU limit in as an environment variable, letting the platform tell the process what it's been given:
+
+```yaml
+env:
+  - name: CPU_LIMIT
+    valueFrom:
+      resourceFieldRef:
+        resource: limits.cpu
+        divisor: "1"      # rounds fractional limits UP to whole cores
+```
+
 - **Core count is only half the budget** — each process is a full interpreter with its own memory space, so also account for available RAM: `min(available_cores, available_ram // estimated_ram_per_worker)`.
 - **Spawning more processes than RAM supports** causes swapping or OOM kills, which is far worse than the parallelism you gained by adding them.
 - **Rule of thumb**: profile one worker's peak RSS first, then size the pool against both constraints — don't just default to `cpu_count()`.
@@ -229,39 +265,31 @@ print(counter)  # always 400_000 — without the lock, this is racy and comes ou
 
 - Lock generalized to N permits — bounding concurrency (e.g. "only 5 requests at once")
 
-Say we're fanning out two kinds of calls to the same Bedrock model — "describe this image" and "summarize this text" — across threads. Different operations, same endpoint, same provider-enforced rate limit shared across both:
+Say we're fanning out two kinds of calls to the same API — "how many stars does this repo have" and "how many public repos does this user have" — across threads. Different operations, same host, same account-wide rate limit shared across both:
 
 ```python
-import boto3
+import os
+import requests
+from pathlib import Path
 
-bedrock = boto3.client("bedrock-runtime")
+session = requests.Session()
+if token := os.environ.get("GITHUB_TOKEN"):
+    session.headers["Authorization"] = f"Bearer {token}"  # 60/hr -> 5,000/hr
 
-# Region-versioned cross-region inference profile. The bare base model ID
-# ("anthropic.claude-sonnet-4-5-20250929-v1:0") returns HTTP 400 on current
-# Claude models — Bedrock requires an inference profile. Swap the "us." prefix
-# for "eu." / "apac." / "global." to change the routing scope.
-MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+def fetch_repo(full_name: str) -> int:
+    r = session.get(f"https://api.github.com/repos/{full_name}", timeout=10)
+    r.raise_for_status()
+    return r.json()["stargazers_count"]
 
-def describe_image(payload):
-    return bedrock.invoke_model(modelId=MODEL_ID, body=build_body(f"Describe this image: {payload}"))
+def fetch_user(login: str) -> int:
+    r = session.get(f"https://api.github.com/users/{login}", timeout=10)
+    r.raise_for_status()
+    return r.json()["public_repos"]
 
-def summarize_text(payload):
-    return bedrock.invoke_model(modelId=MODEL_ID, body=build_body(f"Summarize: {payload}"))
-
-# One "node" per operation — same shape as a LangGraph node registry
-NODES = {
-    "describe_image": describe_image,
-    "summarize_text": summarize_text,
-}
-
-tasks = (
-    [("describe_image", img) for img in images]
-    + [("summarize_text", txt) for txt in texts]
-)
-
-def call_bedrock(task):
-    operation, payload = task
-    return NODES[operation](payload)
+if __name__ == "__main__":
+    repos = Path("data/repos.txt").read_text(encoding="utf-8").split()
+    users = Path("data/users.txt").read_text(encoding="utf-8").split()
+    print(f"{len(repos)} repos + {len(users)} users to fetch")
 ```
 
 **Scenario 1 — as many threads as possible:**
@@ -269,58 +297,66 @@ def call_bedrock(task):
 ```python
 from concurrent.futures import ThreadPoolExecutor
 
-# One thread per task, no cap — blasts the endpoint with every
-# request at once regardless of what the provider can actually handle
-with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-    results = list(executor.map(call_bedrock, tasks))
-    # botocore.exceptions.ClientError: An error occurred (ThrottlingException)
-    # — the account-level rate limit gets blown through almost immediately
+# ... inside if __name__ == "__main__":
+
+# One thread per name, no cap — fires every request at once, regardless
+# of what GitHub actually allows
+with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
+    futures = [executor.submit(fetch_repo, name) for name in repos]
+    futures += [executor.submit(fetch_user, login) for login in users]
+    results = [f.result() for f in futures]
+    # requests.exceptions.HTTPError: 403 Client Error: rate limit exceeded
+    # — unauthenticated that's 60 requests, so it fails almost immediately
 ```
 
-**Scenario 2 — add retries with backoff + jitter:**
+**Scenario 2 — retry when we get told off:**
 
 ```python
-import random
 import time
-from botocore.exceptions import ClientError
+import requests
 
-def call_bedrock_with_retry(task, max_retries=6):
-    for attempt in range(max_retries):
+def call_with_retry(fn, arg, max_attempts=5):
+    for attempt in range(max_attempts):
         try:
-            return call_bedrock(task)
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ThrottlingException":
+            return fn(arg)
+        except requests.HTTPError as e:
+            if e.response.status_code not in (403, 429):
                 raise
-            # exponential backoff + jitter so retries from different threads
-            # don't all land on the server at the same instant
-            sleep_s = (2 ** attempt) * 0.5 + random.uniform(0, 0.5)
-            time.sleep(sleep_s)
-    raise RuntimeError(f"Gave up on {task} after {max_retries} retries")
+            # GitHub sends retry-after — honour the server's number instead
+            # of guessing with exponential backoff
+            time.sleep(int(e.response.headers.get("retry-after", 2 ** attempt)))
+    raise RuntimeError(f"{fn.__name__} still limited after {max_attempts} attempts")
 
-with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-    results = list(executor.map(call_bedrock_with_retry, tasks))
-    # Correct now, but slower — every throttled call still burns a round
-    # trip, and the backoff sleeps stack up under sustained load
+# executor.submit passes any extra args straight through to the callable
+with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
+    futures = [executor.submit(call_with_retry, fetch_repo, n) for n in repos]
+    futures += [executor.submit(call_with_retry, fetch_user, u) for u in users]
+    results = [f.result() for f in futures]
+    # Correct, but wasteful — every rejected call still costs a round trip,
+    # and we only discover we were going too fast after being told off
 ```
 
-**Scenario 3 — size a semaphore to the provider's actual limit:**
+**Scenario 3 — size a semaphore to the documented concurrency limit:**
 
 ```python
 import threading
 
-# Say Bedrock allows 10 concurrent requests against this model for our account
-RATE_LIMIT = 10
-semaphore = threading.Semaphore(RATE_LIMIT)
+# GitHub documents "no more than 100 concurrent requests" — stay well under it.
+# One semaphore shared by both operations, because the limit is per account.
+MAX_CONCURRENT = 10
+semaphore = threading.Semaphore(MAX_CONCURRENT)
 
-def call_bedrock_limited(task):
+def call_limited(fn, arg):
     with semaphore:  # the 11th caller blocks here until a permit frees up
-        return call_bedrock(task)
+        return call_with_retry(fn, arg)
 
-with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-    results = list(executor.map(call_bedrock_limited, tasks))
-    # Never exceeds what the provider allows, so we stop paying for
-    # throttled requests and retries entirely — just steady, bounded throughput
+with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
+    futures = [executor.submit(call_limited, fetch_repo, n) for n in repos]
+    futures += [executor.submit(call_limited, fetch_user, u) for u in users]
+    results = [f.result() for f in futures]
 ```
+
+**The semaphore does not replace the retry — it composes with it.** The semaphore keeps us under the *concurrency* limit we know about; the retry still covers the limits we don't (per-hour quotas, secondary limits, someone else on the same token).
 
 ---
 
@@ -367,15 +403,29 @@ An asyncio task, by contrast, is just a Python object with a small heap footprin
 
 ### Bounding Concurrency: `asyncio.Semaphore`
 
-The rate-limit problem from [section 8](#8-semaphores) doesn't go away just because tasks are cheap — if anything it gets worse, because it's now trivial to have 10,000 requests in flight. Same fix, async flavour:
+The rate-limit problem from [section 8](#8-semaphores) doesn't go away just because tasks are cheap — if anything it gets worse, because it's now trivial to have 10,000 requests in flight. Same idea as the threading version — only the flavour of the primitive changes:
 
 ```python
-RATE_LIMIT = 10
-semaphore = asyncio.Semaphore(RATE_LIMIT)  # create inside the running loop
+import asyncio
+import httpx
 
-async def fetch_limited(client, url):
+MAX_CONCURRENT = 10
+
+async def fetch_limited(semaphore, client, url):
     async with semaphore:  # the 11th caller awaits here until a permit frees up
         return await fetch_url(client, url)
+
+async def main():
+    urls = get_urls_to_fetch()
+    # Created inside main() so it belongs to the loop that asyncio.run() starts
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    async with httpx.AsyncClient() as client:
+        return await asyncio.gather(
+            *(fetch_limited(semaphore, client, u) for u in urls)
+        )
+
+if __name__ == "__main__":
+    results = asyncio.run(main())
 ```
 
 Note there's no pool size to tune here. With threads, `max_workers` served double duty as both the concurrency cap and the resource budget; with asyncio the semaphore is the *only* cap you need, because tasks themselves are nearly free.
@@ -396,10 +446,9 @@ Note there's no pool size to tune here. With threads, `max_workers` served doubl
 - **asyncio is overkill** for a few dozen calls in an otherwise synchronous codebase. A `ThreadPoolExecutor` gets the same wall-clock win with existing `requests`/`boto3` code and no rewrite. Section 6's thread pool is the pragmatic default; asyncio is what you graduate to when thread count itself becomes the bottleneck.
 - **Neither helps CPU-bound work.** asyncio is still one thread under one GIL — a tight numeric loop blocks the loop just like `time.sleep` does. That's what section 6's processes are for.
 
-https://medium.com/data-science/deep-dive-into-multithreading-multiprocessing-and-asyncio-94fdbe0c91f0
-
-https://www.youtube.com/watch?v=Ww2HBNpu98g
-Demystifying AsyncIO: Building Your Own Event Loop in Python — Arthur Pastel
+*Further reading:*
+- [Deep Dive into Multithreading, Multiprocessing, and Asyncio](https://medium.com/data-science/deep-dive-into-multithreading-multiprocessing-and-asyncio-94fdbe0c91f0)
+- [Demystifying AsyncIO: Building Your Own Event Loop in Python — Arthur Pastel](https://www.youtube.com/watch?v=Ww2HBNpu98g)
 
 ---
 

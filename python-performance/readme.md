@@ -1,4 +1,26 @@
+---
+marp: true
+theme: default
+paginate: true
+style: |
+  section {
+    font-size: 24px;
+  }
+  table {
+    font-size: 16px;
+  }
+  table th, table td {
+    font-size: 16px;
+    padding: 4px 8px;
+  }
+  pre > code {
+    font-size: 18px;
+  }
+---
+
 # A Practical Guide to Fast, Concurrent Python
+
+**Andrzej Niedziółka**
 
 ### Agenda:
 - GIL (Global interpreter lock) - what is it and how it came to life
@@ -8,15 +30,21 @@
 - asyncio
 - No-GIL Python 3.14
 
+---
+
 ## Why do we need GIL?
 
 ### Reference counting - Primary garbage collection mechanism
 
-![Python reference counting mechanism](python_refcount_mechanics.svg)
+![width:1000px](python_refcount_mechanics.svg)
+
+---
 
 ### Race condition it causes
 
-![Reference counting race condition causing a double free](refcount_race_double_free.svg)
+![width:900px](refcount_race_double_free.svg)
+
+---
 
 ### Locks to the rescue
 
@@ -41,6 +69,8 @@ for t in threads:
 print(counter)  # always 400_000 — without the lock, this is racy and comes out lower
 ```
 
+---
+
 ### GIL (Global interpreter lock)
 
 - A thread must acquire the GIL before running any bytecode; if another thread holds it, the requesting thread waits.
@@ -48,13 +78,21 @@ print(counter)  # always 400_000 — without the lock, this is racy and comes ou
   - when a thread executes a blocking I/O operation (network requests, file reads), letting other threads proceed
   - after a fixed switching interval (default 5ms), which forces a context switch to the next waiting thread
 
-![Global Interpreter Lock sequence diagram](gil.svg)
+---
 
-**However, multiprocessing sidesteps the GIL entirely:** each process is a separate Python interpreter with its own GIL, so CPU-bound tasks can run in true parallel across multiple cores:
+![width:600px](gil.svg)
 
-![Each process has its own GIL, enabling true parallelism](processes-gil.svg)
+---
 
+### Multiprocessing sidesteps the GIL
+
+**Each process is a separate Python interpreter with its own GIL**, so CPU-bound tasks can run in true parallel across multiple cores:
+
+![width:900px](processes-gil.svg)
+
+<!--
 *Further reading: [What is the GIL in Python and why should you care?](https://dev.to/imsushant12/what-is-the-gil-in-python-and-why-should-you-care-1cai)*
+-->
 
 ---
 
@@ -62,25 +100,31 @@ print(counter)  # always 400_000 — without the lock, this is racy and comes ou
 
 Most other managed languages (C#, Java, etc.) use a **tracing garbage collector**.
 
-![Tracing garbage collector mark phase](tracing-gc-mark-phase.svg)
+![width:650px](tracing-gc-mark-phase.svg)
 
 ---
 
-# Types of perfomance problems
+## Types of Performance Problems
 
-- I/O-bound: API calls, DB queries, file/network reads
-- CPU-bound: image resizing, number crunching, parsing/serialization
+---
 
-**I/O bound**
+### I/O-bound vs CPU-bound
 
-- [Paralelize using threads](#multithreading) - cheaper and faster than processes
+- **I/O-bound**: API calls, DB queries, file/network reads
+- **CPU-bound**: image resizing, number crunching, parsing/serialization
+
+---
+
+### Performance Problem Strategies
+
+**I/O-bound problems:**
+- Parallelize using threads - cheaper and faster than processes
 - Cache heavily
 
-**CPU bound**
-
+**CPU-bound problems:**
 - Because of GIL, spawning multiple threads won't help
-- 1st strategy: [**optimize** the code itself](#cpu---optimizing-the-code-without-parallelization)
-- 2nd strategy: [paralelize using **processes**](#cpu---paralelize-using-processes)
+- 1st strategy: **optimize** the code itself
+- 2nd strategy: parallelize using **processes**
 
 ---
 
@@ -93,54 +137,58 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 def fetch_url(url):
-    response = requests.get(url)  # blocks waiting on the network — GIL is released here
+    response = requests.get(url)
     return response.status_code
 
-urls = get_urls_to_fetch()  # e.g. this returns 37 URLs
+urls = get_urls_to_fetch()
 
 with ThreadPoolExecutor(max_workers=len(urls)) as executor:
-    executor.map(fetch_url, urls)
+    futures = [executor.submit(fetch_url, url) for url in urls]
+    results = [f.result() for f in futures]
+    print(results)
 ```
 
-**Sizing**
+---
+
+### Sizing ThreadPoolExecutor
 
 ```python
 urls = get_urls_to_fetch()  # say this returns 37 URLs
 
 with ThreadPoolExecutor(max_workers=len(urls)) as executor:
-    executor.map(fetch_url, urls)
+    futures = [executor.submit(fetch_url, url) for url in urls]
+    results = [f.result() for f in futures]
+    print(results) 
 ```
+
+---
 
 ### Semaphores
 
-- Lock generalized to N permits — bounding concurrency (e.g. "only 5 requests at once")
+Lock generalized to N permits — bounding concurrency (e.g. "only 5 requests at once")
 
 ```python
-import os
 import requests
 from pathlib import Path
 
 session = requests.Session()
-if token := os.environ.get("GITHUB_TOKEN"):
-    session.headers["Authorization"] = f"Bearer {token}"  # 60/hr -> 5,000/hr
 
 def fetch_repo(full_name: str) -> int:
     r = session.get(f"https://api.github.com/repos/{full_name}", timeout=10)
-    r.raise_for_status()
     return r.json()["stargazers_count"]
 
 def fetch_user(login: str) -> int:
     r = session.get(f"https://api.github.com/users/{login}", timeout=10)
-    r.raise_for_status()
-    return r.json()["public_repos"]
+    return r.json()["followers"]
 
 if __name__ == "__main__":
-    repos = Path("data/repos.txt").read_text(encoding="utf-8").split()
-    users = Path("data/users.txt").read_text(encoding="utf-8").split()
-    print(f"{len(repos)} repos + {len(users)} users to fetch")
+    repos = Path("data/repos.txt").read_text().split()
+    users = Path("data/users.txt").read_text().split()
 ```
 
-**Scenario 1 — as many threads as possible:**
+---
+
+### Scenario 1: As many threads as possible
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -157,7 +205,9 @@ with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
     # — unauthenticated that's 60 requests, so it fails almost immediately
 ```
 
-**Scenario 2 — retry when we get told off:**
+---
+
+### Scenario 2: Retry when we get told off
 
 ```python
 import time
@@ -170,21 +220,18 @@ def call_with_retry(fn, arg, max_attempts=5):
         except requests.HTTPError as e:
             if e.response.status_code not in (403, 429):
                 raise
-            # GitHub sends retry-after — honour the server's number instead
-            # of guessing with exponential backoff
             time.sleep(int(e.response.headers.get("retry-after", 2 ** attempt)))
     raise RuntimeError(f"{fn.__name__} still limited after {max_attempts} attempts")
 
-# executor.submit passes any extra args straight through to the callable
 with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
     futures = [executor.submit(call_with_retry, fetch_repo, n) for n in repos]
     futures += [executor.submit(call_with_retry, fetch_user, u) for u in users]
     results = [f.result() for f in futures]
-    # Correct, but wasteful — every rejected call still costs a round trip,
-    # and we only discover we were going too fast after being told off
 ```
 
-**Scenario 3 — size a semaphore to the documented concurrency limit:**
+---
+
+### Scenario 3: Size a semaphore to the documented limit
 
 ```python
 import threading
@@ -208,70 +255,85 @@ with ThreadPoolExecutor(max_workers=len(repos) + len(users)) as executor:
 
 ---
 
-## CPU - Optimizing the code (Without Parallelization)
+## CPU - Optimizing the code
 
 Before reaching for threads or processes, it's often cheaper — and simpler — to just make the single-threaded code faster:
 
-- **Swap list membership checks for set/dict lookups** — `x in my_list` is O(n): every check can scan the whole list. `x in my_set` (or `x in my_dict`) is O(1) via hashing.
+---
+
+### Optimization 1: Set/Dict lookups
+
+Swap list membership checks for set/dict lookups — `x in my_list` is O(n), `x in my_set` is O(1):
 
 ```python
-needle = "z"  # the value we're checking for membership
-
-# O(n) per check — scans the whole list every time
-allowed = ["a", "b", "c", "..."]
+needle = "z"
+# O(n) per check
+allowed = ["a", "b", "c"]
 if needle in allowed:
     ...
 
-# O(1) per check — same logic, hash lookup instead of a scan
-allowed = {"a", "b", "c", "..."}
+# O(1) per check
+allowed = {"a", "b", "c"}
 if needle in allowed:
     ...
 ```
 
-- **`io.StringIO` for building strings in a loop** — strings are immutable, so repeated `+=` allocates a brand-new string and copies the old contents in every time (quadratic). `io.StringIO` gives you a mutable buffer to write into instead.
+---
+
+### Optimization 2: `io.StringIO` for building strings in a loop 
+
+Strings are immutable, so repeated `+=` is quadratic. `io.StringIO` uses a mutable buffer:
 
 ```python
 import io
 
-# Quadratic — each += allocates a new string and copies everything so far into it
+# Quadratic — each += allocates new string
 result = ""
 for chunk in chunks:
     result += chunk
 
-# Linear — StringIO writes into a buffer; one final allocation via getvalue()
+# Linear — writes into buffer
 buf = io.StringIO()
 for chunk in chunks:
     buf.write(chunk)
 result = buf.getvalue()
 ```
 
-- **Reach for libraries that drop into C under the hood** — NumPy (and similarly Pandas, Cython-based libraries) do the actual number crunching in compiled C over contiguous memory, sidestepping the per-element bytecode dispatch and refcounting overhead of a Python loop entirely.
+---
+
+### Optimization 3: Reach for libraries that drop into C under the hood
+
+NumPy does number crunching in compiled C over contiguous memory:
 
 ```python
 import numpy as np
 
-# Pure Python — one bytecode dispatch, refcount bump, etc. per element
+# Pure Python — per-element bytecode dispatch
 squares = [x * x for x in range(1_000_000)]
 
-# NumPy — the loop runs once, in C, over a contiguous buffer
+# NumPy — runs once in C
 squares = np.arange(1_000_000) ** 2
 ```
 
 ---
 
-## CPU - Paralelize using processes
+## CPU - Parallelize using processes
 
 ```python
 from concurrent.futures import ProcessPoolExecutor
 
 def crunch_numbers(n):
-    return sum(i * i for i in range(n))  # simulate CPU-bound work
+    return sum(i * i for i in range(n))
 
 with ProcessPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(crunch_numbers, [10_000_000] * 10))
+    results = list(
+        executor.map(crunch_numbers, [10_000_000] * 10)
+    )
 ```
 
-**Sizing**
+---
+
+### Sizing ProcessPoolExecutor
 ```python
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -289,7 +351,10 @@ worker_count = max(1, available_cores - 1)  # leave a core for the OS/main proce
 with ProcessPoolExecutor(max_workers=worker_count) as executor:
     results = list(executor.map(crunch_numbers, [10_000_000] * 10))
 ```
-**Kubernetes example** - pass cpu cores as environment variable
+
+---
+
+### Kubernetes: Pass CPU cores as environment variable
 
 ```yaml
 env:
@@ -300,11 +365,23 @@ env:
         divisor: "1"      # rounds fractional limits UP to whole cores
 ```
 
-**Spawning more processes also increases RAM usage, be careful not to run out of memory.**
+**Spawning more processes increases RAM usage — be careful not to run out of memory.**
 
---- 
+---
 
-# Threads vs Processes summary
+<style scoped>
+section {
+  font-size: 20px;
+}
+table {
+  font-size: 16px;
+}
+table th, table td {
+  padding: 12px 8px;
+}
+</style>
+
+## Threads vs Processes summary
 
 | Feature | Threads | Processes |
 |---|---|---|
@@ -316,62 +393,82 @@ env:
 | Communication | Direct memory access (easier) | Pipes/queues (more complex) |
 | Robustness | Lower (crash affects whole process) | Higher (isolation prevents cascade failure) |
 
-![threads-vs-processes](threads-visualized.png)
+---
 
---- 
+![width:950px](threads-visualized.png)
 
-# asyncio
+---
 
-- library for writing concurrent code using the familiar **async/await** syntax
-- great for **high-volume I/O** operations
-- uses **single-threaded** event loop, removing the need for creating and switching between threads
+## asyncio
+
+- **async/await** syntax for concurrent code
+- Great for **high-volume I/O**
+- **Single-threaded** event loop (no switching overhead)
+
+---
+
+### Simple asyncio example
 
 ```python
 import asyncio
 import httpx
 
 async def fetch_url(client, url):
-    response = await client.get(url)  # yields control back to the loop while waiting
+    response = await client.get(url)
     return response.status_code
 
 async def main():
-    urls = get_urls_to_fetch()  # e.g. this returns 37 URLs
+    urls = get_urls_to_fetch()
     async with httpx.AsyncClient() as client:
-        # all 37 requests are in flight concurrently — on one thread
-        return await asyncio.gather(*(fetch_url(client, u) for u in urls))
+        return await asyncio.gather(
+            *(fetch_url(client, u) for u in urls))
 
 asyncio.run(main())
 ```
 
-Same idea as the threading version — only the flavour of the primitive changes:
+---
+
+### asyncio with semaphore
+
+Same idea as threads — only the primitive changes:
 
 ```python
 import asyncio
 import httpx
 
 MAX_CONCURRENT = 10
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-async def fetch_limited(semaphore, client, url):
-    async with semaphore:  # the 11th caller awaits here until a permit frees up
+async def fetch_limited(client, url):
+    async with semaphore:
         return await fetch_url(client, url)
 
 async def main():
     urls = get_urls_to_fetch()
-    # Created inside main() so it belongs to the loop that asyncio.run() starts
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     async with httpx.AsyncClient() as client:
         return await asyncio.gather(
-            *(fetch_limited(semaphore, client, u) for u in urls)
-        )
+            *(fetch_limited(client, u) for u in urls))
 
-if __name__ == "__main__":
-    results = asyncio.run(main())
+asyncio.run(main())
 ```
 
-Note there's no pool size to tune here. With threads, `max_workers` doubles as both
-the concurrency cap and the resource budget; with asyncio the semaphore is the only
-cap you need, because the tasks themselves are nearly free.
+---
 
+<style scoped>
+section {
+  font-size: 20px;
+}
+table {
+  font-size: 16px;
+}
+table th, table td {
+  padding: 12px 8px;
+}
+</style>
+
+### Threads vs asyncio
+
+With threads, `max_workers` is both cap and budget. With asyncio, only the semaphore caps concurrency (tasks are nearly free).
 
 | | Threads | asyncio |
 |---|---|---|
@@ -383,16 +480,48 @@ cap you need, because the tasks themselves are nearly free.
 | CPU-bound work | still GIL-limited | still GIL-limited (use processes) |
 
 
+<!--
 *Further reading:*
 - [Deep Dive into Multithreading, Multiprocessing, and Asyncio](https://medium.com/data-science/deep-dive-into-multithreading-multiprocessing-and-asyncio-94fdbe0c91f0)
 - [Demystifying AsyncIO: Building Your Own Event Loop in Python — Arthur Pastel](https://www.youtube.com/watch?v=Ww2HBNpu98g)
+-->
 
 ---
 
 ## Free-Threaded Python (3.14)
 
-- **Two refcount fields instead of one, plus an owning-thread id.** The thread that owns an object updates its *local* count with plain, non-atomic writes; other threads touch a separate *shared* count. Because only one thread ever writes the local field, the common case needs **no locking and no atomic instructions** at all — the true refcount is the sum of the two.
-- **Containers get per-object locks, not a global one.** Each `dict`, `list`, and `set` carries its own fine-grained lock, so two threads mutating two different dicts never contend with each other. Contention is now scoped to the specific object being shared, not to the entire interpreter.
-- **GC pauses.** Cyclic garbage collection can no longer rely on the GIL to hold the object graph still, so it now does **two brief stop-the-world pauses** to get a consistent view. Short, but they exist — unlike the classic build, where the collector simply ran under the GIL.
-- **Requires compatible dependecies**. Any C extension that isn't explicitly marked thread-safe **re-enables the GIL for the whole process** when it's imported. 
-- Free-threading is what eventually makes `ThreadPoolExecutor` the right answer for *both* kinds of workload.
+### Two refcount fields per object
+
+**Thread that owns object updates *local* count (no locking).** Other threads touch *shared* count. True refcount = local + shared.
+
+Result: **no locking and no atomic instructions** for the common case.
+
+---
+
+### Per-object locks for containers
+
+Each `dict`, `list`, `set` has its own fine-grained lock. Two threads mutating different dicts never contend.
+
+---
+
+### GC pauses
+
+Garbage collection now does **two brief stop-the-world pauses** (unlike classic GIL-protected collection).
+
+---
+
+### Dependency requirements
+
+Any C extension not explicitly marked thread-safe **re-enables the GIL for the whole process** when imported.
+
+---
+
+### Impact
+
+Free-threading makes `ThreadPoolExecutor` the right answer for **both** CPU-bound and I/O-bound workloads.
+
+---
+
+# Thank You!
+
+Questions?
