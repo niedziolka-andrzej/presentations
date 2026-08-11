@@ -80,7 +80,17 @@ print(counter)  # always 400_000 — without the lock, this is racy and comes ou
 
 ---
 
-![width:600px](gil.svg)
+<style scoped>
+section {
+  padding: 24px;
+}
+section img {
+  display: block;
+  margin: 0 auto;
+}
+</style>
+
+![width:668px](gil.svg)
 
 ---
 
